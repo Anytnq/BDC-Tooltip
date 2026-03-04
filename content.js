@@ -163,6 +163,37 @@
         });
         hasGlobalMenuClickHandler = true;
       }
+      if (!hasGlobalKeydownHandler) {
+        document.addEventListener("keydown", (event) => {
+          if (
+            event.target.tagName === "INPUT" ||
+            event.target.tagName === "TEXTAREA"
+          ) {
+            return;
+          }
+          const video = getActiveVideo();
+          if (!video) {
+            return;
+          }
+          switch (event.key) {
+            case "ArrowLeft":
+              event.preventDefault();
+              video.currentTime = clampTime(
+                video,
+                video.currentTime - SEEK_TIME_SECONDS,
+              );
+              break;
+            case "ArrowRight":
+              event.preventDefault();
+              video.currentTime = clampTime(
+                video,
+                video.currentTime + SEEK_TIME_SECONDS,
+              );
+              break;
+          }
+        });
+        hasGlobalKeydownHandler = true;
+      }
       const speedContainer = document.createElement("div");
       speedContainer.style.display = "flex";
       speedContainer.style.alignItems = "center";
