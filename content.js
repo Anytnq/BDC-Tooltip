@@ -2,333 +2,244 @@
   "use strict";
   const ROOT_ID = "bdc-tools-root";
   const MENU_CLASS = "bdc-tools-menu";
-  const OBSERVER_DEBOUNCE_MS = 120;
-  const SEEK_TIME_SECONDS = 5;
-  let hasGlobalMenuClickHandler = false;
-  let refreshTimer = null;
-  function getActiveVideo() {
-    const videos = Array.from(document.querySelectorAll("video"));
-    if (!videos.length) {
-      return null;
-    }
-    const visibleVideos = videos.filter((video) => {
-      const rect = video.getBoundingClientRect();
-      const style = window.getComputedStyle(video);
-      return (
-        rect.width > 0 &&
-        rect.height > 0 &&
-        style.visibility !== "hidden" &&
-        style.display !== "none"
-      );
-    });
-    const candidates = visibleVideos.length ? visibleVideos : videos;
-    const playingVideo = candidates.find(
-      (video) => !video.paused && !video.ended && video.readyState >= 2,
+  const SEEK = 5;
+  const SPEEDS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+  let indTimer, obsTimer;
+  const css = `
+    #bdc-speed-indicator { position:absolute; right:8px; background:rgba(0,0,0,.75); color:white; padding:4px 8px; border-radius:4px; font:bold 14px sans-serif; z-index:9999; pointer-events:none; opacity:0; transition:opacity .2s ease-out; }
+    .${MENU_CLASS} { position:absolute; bottom:50px; right:0; background:rgba(0,0,0,.8); padding:10px; min-width:180px; border-radius:5px; z-index:9999; display:none; color:white; }
+    .${MENU_CLASS} div { display:flex; align-items:center; justify-content:center; margin-bottom:10px; }
+    .${MENU_CLASS} label { width:56px; text-align:right; margin-right:10px; }
+    .${MENU_CLASS} button { margin:0 2px; cursor:pointer; }
+    #${ROOT_ID} { background:none; border:none; color:white; font-size:20px; cursor:pointer; display:flex; align-items:center; justify-content:center; width:28px; height:28px; padding:0; margin-right:8px; }
+  `;
+  const el = (tag, props = {}) =>
+    Object.assign(document.createElement(tag), props);
+  function getVid() {
+    const vids = [...document.querySelectorAll("video")].filter(
+      (v) => v.offsetWidth > 0 && v.offsetHeight > 0,
     );
-    if (playingVideo) {
-      return playingVideo;
+    return (
+      vids.find((v) => !v.paused && v.readyState >= 2) ||
+      vids.sort(
+        (a, b) =>
+          b.offsetWidth * b.offsetHeight - a.offsetWidth * a.offsetHeight,
+      )[0]
+    );
+  }
+  function fwd(v, amt) {
+    if (v) {
+      v.currentTime = Math.max(
+        0,
+        Math.min(v.duration || Infinity, v.currentTime + amt),
+      );
     }
-    return candidates.sort((a, b) => {
-      const rectA = a.getBoundingClientRect();
-      const rectB = b.getBoundingClientRect();
-      return rectB.width * rectB.height - rectA.width * rectA.height;
-    })[0];
   }
-  function clampTime(video, time) {
-    if (!Number.isFinite(time)) {
-      return video.currentTime;
+  function showInd(speed) {
+    const v = getVid();
+    if (!v) {
+      return;
     }
-    const maxTime = Number.isFinite(video.duration) ? video.duration : Infinity;
-    return Math.max(0, Math.min(maxTime, time));
+    const isFS = document.fullscreenElement;
+    let cont =
+      (isFS && isFS.contains(v) && isFS) ||
+      v.closest(".txp_player, .player_container, .txp_video_container") ||
+      v.parentElement ||
+      document.body;
+    let ind = cont.querySelector("#bdc-speed-indicator");
+    if (!ind) {
+      ind = el("div", { id: "bdc-speed-indicator" });
+      if (window.getComputedStyle(cont).position === "static") {
+        cont.style.position = "relative";
+      }
+      cont.appendChild(ind);
+    }
+    const prog = cont.querySelector(".txp_progress");
+    let bot = prog
+      ? cont.getBoundingClientRect().bottom -
+        prog.getBoundingClientRect().top +
+        (isFS ? 8 : 70)
+      : isFS
+        ? 18
+        : 70;
+    ind.style.bottom = `${
+      Number.isFinite(bot) && bot >= 0 ? bot : isFS ? 18 : 70
+    }px`;
+    ind.textContent = `${speed.toFixed(2)}x`;
+    clearTimeout(indTimer);
+    ind.style.opacity = 1;
+    indTimer = setTimeout(() => {
+      ind.style.opacity = 0;
+    }, 800);
   }
-  function stopEventBubble(element) {
-    [
-      "mousedown",
-      "mouseup",
-      "click",
-      "dblclick",
-      "pointerdown",
-      "pointerup",
-    ].forEach((eventName) => {
-      element.addEventListener(eventName, (event) => {
-        event.stopPropagation();
-      });
-    });
-  }
-  function applyDynamicEnhancements() {
-    const guiltyDetail = document.getElementById("guiltyDetail");
-    if (guiltyDetail) {
-      guiltyDetail.placeholder =
+  function applyDyn() {
+    const g = document.getElementById("guiltyDetail");
+    const n = document.getElementById("notSureReason");
+    if (g) {
+      g.placeholder =
         "Please provide a detailed description of the violation (maximum 50 characters)";
     }
-    const notSureReason = document.getElementById("notSureReason");
-    if (notSureReason) {
-      notSureReason.placeholder =
+    if (n) {
+      n.placeholder =
         "Insufficient supplementary evidence (maximum 50 characters)";
     }
-    const watermarkSpans = document.querySelectorAll(".watermark span");
-    watermarkSpans.forEach((watermarkSpan) => {
-      watermarkSpan.style.display = "none";
+    document.querySelectorAll(".watermark span").forEach((s) => {
+      s.style.display = "none";
     });
   }
-  function initialize() {
+  function init() {
     if (document.getElementById(ROOT_ID)) {
       return;
     }
-    const controlsContainer = document.querySelector(".txp_center_controls");
-    const rightControls = document.querySelector(".txp_right_controls");
-    if (controlsContainer && rightControls) {
-      const speedLabel = document.createElement("label");
-      speedLabel.innerText = "Speed:";
-      speedLabel.style.color = "white";
-      speedLabel.style.display = "inline-block";
-      speedLabel.style.width = "56px";
-      speedLabel.style.textAlign = "right";
-      speedLabel.style.margin = "0 10px 0 0";
-      const speedSelector = document.createElement("select");
-      const speeds = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
-      speeds.forEach((speed) => {
-        const option = document.createElement("option");
-        option.value = speed;
-        option.innerText = `${speed}x`;
-        if (speed === 1.0) {
-          option.selected = true;
-        }
-        speedSelector.appendChild(option);
-      });
-      speedSelector.addEventListener("change", (event) => {
-        const activeVideo = getActiveVideo();
-        if (!activeVideo) {
-          return;
-        }
-        activeVideo.playbackRate = parseFloat(event.target.value);
-      });
-      speedSelector.style.marginLeft = "5px";
-      const settingsButton = document.createElement("button");
-      settingsButton.innerText = "⚙️";
-      settingsButton.style.background = "none";
-      settingsButton.style.border = "none";
-      settingsButton.style.color = "white";
-      settingsButton.style.fontSize = "20px";
-      settingsButton.style.width = "28px";
-      settingsButton.style.height = "28px";
-      settingsButton.style.cursor = "pointer";
-      settingsButton.style.padding = "0";
-      settingsButton.style.marginRight = "8px";
-      settingsButton.style.display = "flex";
-      settingsButton.style.alignItems = "center";
-      settingsButton.style.justifyContent = "center";
-      settingsButton.id = ROOT_ID;
-      rightControls.insertBefore(settingsButton, rightControls.firstChild);
-      const settingsMenu = document.createElement("div");
-      settingsMenu.style.position = "absolute";
-      settingsMenu.style.bottom = "50px";
-      settingsMenu.style.right = "0";
-      settingsMenu.style.backgroundColor = "rgba(0, 0, 0, 0.8)";
-      settingsMenu.style.padding = "10px";
-      settingsMenu.style.minWidth = "180px";
-      settingsMenu.style.borderRadius = "5px";
-      settingsMenu.style.zIndex = "9999";
-      settingsMenu.style.display = "none";
-      settingsMenu.classList.add(MENU_CLASS);
-      rightControls.appendChild(settingsMenu);
-      stopEventBubble(settingsButton);
-      stopEventBubble(settingsMenu);
-      const syncSpeed = () => {
-        const activeVideo = getActiveVideo();
-        if (!activeVideo) {
-          return;
-        }
-        speedSelector.value = String(activeVideo.playbackRate);
-      };
-      settingsButton.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        syncSpeed();
-        settingsMenu.style.display =
-          settingsMenu.style.display === "none" ? "block" : "none";
-      });
-      if (!hasGlobalMenuClickHandler) {
-        document.addEventListener("click", (e) => {
-          const clickedButton = e.target.closest(`#${ROOT_ID}`);
-          if (clickedButton) {
-            return;
-          }
-          const menus = document.querySelectorAll(`.${MENU_CLASS}`);
-          menus.forEach((menu) => {
-            if (!menu.contains(e.target)) {
-              menu.style.display = "none";
+    const right = document.querySelector(".txp_right_controls");
+    if (!right) {
+      return;
+    }
+    if (!document.getElementById("bdc-styles")) {
+      document.head.appendChild(
+        el("style", { id: "bdc-styles", textContent: css }),
+      );
+    }
+    const btn = el("button", { id: ROOT_ID, innerText: "⚙️" });
+    const menu = el("div", { className: MENU_CLASS });
+    const sel = el("select", {
+      innerHTML: SPEEDS.map(
+        (s) =>
+          `<option value="${s}" ${s === 1 ? "selected" : ""}>${s}x</option>`,
+      ).join(""),
+    });
+    sel.onchange = (e) => {
+      const v = getVid();
+      if (v) {
+        v.playbackRate = +e.target.value;
+        showInd(v.playbackRate);
+      }
+    };
+    const row = (lbl, child) => {
+      const d = el("div");
+      d.append(el("label", { innerText: lbl }), child);
+      return d;
+    };
+    menu.append(row("Speed:", sel));
+    const frameBox = el("div");
+    [
+      ["<<", -1 / 30],
+      [">>", 1 / 30],
+    ].forEach(([t, a]) => {
+      frameBox.append(
+        el("button", {
+          innerText: t,
+          onclick: (e) => {
+            e.stopPropagation();
+            const v = getVid();
+            if (v) {
+              v.pause();
+              fwd(v, a);
             }
-          });
-        });
-        hasGlobalMenuClickHandler = true;
+          },
+        }),
+      );
+    });
+    menu.append(row("Frame:", frameBox));
+    const utilBox = el("div");
+    [
+      [
+        "|<",
+        "Start",
+        () => {
+          const v = getVid();
+          if (v) {
+            v.currentTime = 0;
+          }
+        },
+      ],
+      ["«", `-${SEEK}s`, () => fwd(getVid(), -SEEK)],
+      ["»", `+${SEEK}s`, () => fwd(getVid(), SEEK)],
+    ].forEach(([t, title, fn]) => {
+      utilBox.append(
+        el("button", {
+          innerText: t,
+          title,
+          onclick: (e) => {
+            e.stopPropagation();
+            fn();
+          },
+        }),
+      );
+    });
+    menu.append(row("Util:", utilBox));
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const v = getVid();
+      if (v) {
+        sel.value = String(v.playbackRate);
       }
-      if (!hasGlobalKeydownHandler) {
-        document.addEventListener("keydown", (event) => {
-          if (
-            event.target.tagName === "INPUT" ||
-            event.target.tagName === "TEXTAREA"
-          ) {
-            return;
-          }
-          const video = getActiveVideo();
-          if (!video) {
-            return;
-          }
-          switch (event.key) {
-            case "ArrowLeft":
-              event.preventDefault();
-              video.currentTime = clampTime(
-                video,
-                video.currentTime - SEEK_TIME_SECONDS,
-              );
-              break;
-            case "ArrowRight":
-              event.preventDefault();
-              video.currentTime = clampTime(
-                video,
-                video.currentTime + SEEK_TIME_SECONDS,
-              );
-              break;
+      menu.style.display = menu.style.display === "block" ? "none" : "block";
+    };
+    right.insertBefore(btn, right.firstChild);
+    right.appendChild(menu);
+  }
+  if (!window.bdcKeyHandler) {
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest(`#${ROOT_ID}`)) {
+        document.querySelectorAll(`.${MENU_CLASS}`).forEach((m) => {
+          if (!m.contains(e.target)) {
+            m.style.display = "none";
           }
         });
-        hasGlobalKeydownHandler = true;
       }
-      const speedContainer = document.createElement("div");
-      speedContainer.style.display = "flex";
-      speedContainer.style.alignItems = "center";
-      speedContainer.style.justifyContent = "center";
-      speedContainer.style.marginBottom = "10px";
-      speedContainer.appendChild(speedLabel);
-      speedContainer.appendChild(speedSelector);
-      settingsMenu.appendChild(speedContainer);
-      const frameStep = 1 / 30;
-      const frameControls = document.createElement("div");
-      frameControls.style.display = "flex";
-      frameControls.style.alignItems = "center";
-      frameControls.style.justifyContent = "center";
-      frameControls.style.marginBottom = "10px";
-      const frameLabel = document.createElement("label");
-      frameLabel.innerText = "Frame:";
-      frameLabel.style.color = "white";
-      frameLabel.style.display = "inline-block";
-      frameLabel.style.width = "56px";
-      frameLabel.style.textAlign = "right";
-      frameLabel.style.marginRight = "10px";
-      frameControls.appendChild(frameLabel);
-      const frameBackButton = document.createElement("button");
-      frameBackButton.innerText = "<<";
-      frameBackButton.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const activeVideo = getActiveVideo();
-        if (!activeVideo) {
-          return;
+    });
+    document.addEventListener("keydown", (e) => {
+      if (["INPUT", "TEXTAREA"].includes(e.target.tagName)) {
+        return;
+      }
+      const v = getVid();
+      if (!v) {
+        return;
+      }
+      const sel = document.querySelector(`.${MENU_CLASS} select`);
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        fwd(v, -SEEK);
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        fwd(v, SEEK);
+      } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        e.preventDefault();
+        const idx = SPEEDS.indexOf(v.playbackRate);
+        const currIdx = idx !== -1 ? idx : SPEEDS.indexOf(1);
+        const nextIdx =
+          e.key === "ArrowUp"
+            ? Math.min(SPEEDS.length - 1, currIdx + 1)
+            : Math.max(0, currIdx - 1);
+
+        if (currIdx !== nextIdx) {
+          const newSpd = SPEEDS[nextIdx];
+          v.playbackRate = newSpd;
+          if (sel) {
+            sel.value = String(newSpd);
+          }
+          showInd(newSpd);
         }
-        activeVideo.pause();
-        activeVideo.currentTime = clampTime(
-          activeVideo,
-          activeVideo.currentTime - frameStep,
-        );
-      });
-      frameControls.appendChild(frameBackButton);
-      const frameForwardButton = document.createElement("button");
-      frameForwardButton.innerText = ">>";
-      frameForwardButton.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const activeVideo = getActiveVideo();
-        if (!activeVideo) {
-          return;
+      } else if (e.key === " ") {
+        e.preventDefault();
+        if (v.paused) {
+          v.play();
+        } else {
+          v.pause();
         }
-        activeVideo.pause();
-        activeVideo.currentTime = clampTime(
-          activeVideo,
-          activeVideo.currentTime + frameStep,
-        );
-      });
-      frameControls.appendChild(frameForwardButton);
-      settingsMenu.appendChild(frameControls);
-      const seekControls = document.createElement("div");
-      seekControls.style.display = "flex";
-      seekControls.style.alignItems = "center";
-      seekControls.style.justifyContent = "center";
-      const seekLabel = document.createElement("label");
-      seekLabel.innerText = "Util:";
-      seekLabel.style.color = "white";
-      seekLabel.style.display = "inline-block";
-      seekLabel.style.width = "56px";
-      seekLabel.style.textAlign = "right";
-      seekLabel.style.marginRight = "10px";
-      seekControls.appendChild(seekLabel);
-      const restartButton = document.createElement("button");
-      restartButton.innerText = "|<";
-      restartButton.title = "Zum Anfang springen";
-      restartButton.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const video = getActiveVideo();
-        if (video) {
-          video.currentTime = 0;
-        }
-      });
-      seekControls.appendChild(restartButton);
-      const seekBackButton = document.createElement("button");
-      seekBackButton.innerText = "«";
-      seekBackButton.title = `-${SEEK_TIME_SECONDS} Sekunden springen`;
-      seekBackButton.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const video = getActiveVideo();
-        if (video) {
-          video.currentTime = clampTime(
-            video,
-            video.currentTime - SEEK_TIME_SECONDS,
-          );
-        }
-      });
-      seekControls.appendChild(seekBackButton);
-      const seekForwardButton = document.createElement("button");
-      seekForwardButton.innerText = "»";
-      seekForwardButton.title = `+${SEEK_TIME_SECONDS} Sekunden springen`;
-      seekForwardButton.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const video = getActiveVideo();
-        if (video) {
-          video.currentTime = clampTime(
-            video,
-            video.currentTime + SEEK_TIME_SECONDS,
-          );
-        }
-      });
-      seekControls.appendChild(seekForwardButton);
-      [restartButton, seekBackButton, seekForwardButton].forEach((btn) => {
-        btn.style.margin = "0 2px";
-      });
-      settingsMenu.appendChild(seekControls);
-    }
-    applyDynamicEnhancements();
+      }
+    });
+    window.bdcKeyHandler = true;
   }
-  function refreshUi() {
-    initialize();
-    applyDynamicEnhancements();
-  }
-  function scheduleRefresh() {
-    if (refreshTimer) {
-      clearTimeout(refreshTimer);
-    }
-    refreshTimer = setTimeout(() => {
-      refreshTimer = null;
-      refreshUi();
-    }, OBSERVER_DEBOUNCE_MS);
-  }
-  const observer = new MutationObserver(() => {
-    scheduleRefresh();
-  });
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-  });
-  refreshUi();
+  new MutationObserver(() => {
+    clearTimeout(obsTimer);
+    obsTimer = setTimeout(() => {
+      init();
+      applyDyn();
+    }, 120);
+  }).observe(document.body, { childList: true, subtree: true });
+  init();
+  applyDyn();
 })();
